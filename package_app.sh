@@ -31,8 +31,17 @@ fi
 
 echo "==> 清理构建缓存..."
 swift package clean >/dev/null 2>&1 || true
-if [ -d "$ROOT_DIR/.build" ]; then
-    rm -rf "$ROOT_DIR/.build"
+BUILD_DIR="$ROOT_DIR/.build"
+if [ -d "$BUILD_DIR" ]; then
+    case "$BUILD_DIR" in
+        */.build)
+            rm -rf "$BUILD_DIR"
+            ;;
+        *)
+            echo "检测到异常构建目录：$BUILD_DIR，已跳过自动删除，请手动检查。" >&2
+            exit 1
+            ;;
+    esac
 fi
 
 echo "==> 构建 release 版本 (arm64)..."
