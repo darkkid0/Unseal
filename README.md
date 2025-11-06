@@ -15,6 +15,27 @@ swift build
 open .build/debug/Unseal.app
 ```
 
+## 打包脚本
+
+仓库根目录提供两套辅助脚本，简化图标生成与通用应用打包流程：
+
+1. **生成 macOS 图标**  
+   在 `icon/`、`icons/macos/` 或自定义目录（可通过脚本参数指定）放置至少 `1024.png`，可选放入 `16.png`、`32.png` 等尺寸。执行：
+   ```bash
+   ./generate_app_icon.sh [图标目录，可选]
+   ```
+   脚本会使用 `sips` 与 `iconutil` 输出 `Sources/AppModule/Resources/AppIcon.icns`，并自动补全缺失尺寸。
+
+2. **构建并打包双架构应用**  
+   ```bash
+   ./package_app.sh
+   ```
+   - 自动清理 `.build` 缓存；
+   - 分别构建 `arm64` 与 `x86_64` 版本（Apple Silicon 需提前安装 Rosetta）；
+   - 利用 `lipo` 合并通用二进制，生成 `.build/release/Unseal.app`。
+
+> 若在 Intel Mac 上运行，将提示无法构建 arm64 版本；建议在 Apple Silicon 机器上执行上述脚本。
+
 > 提示：若构建后未生成 `.app`，可在 Xcode 中打开项目运行，或执行 `swift build --configuration release` 再从 `.build/release` 中启动。
 
 ## 使用步骤
