@@ -91,4 +91,4 @@ iconutil -c icns "$ICONSET_DIR" -o "$OUTPUT_PATH"
 trap - EXIT
 cleanup
 
-echo "已生成 $OUTPUT_PATH（来源目录：$ICON_SRC_DIR）"
+echo "已生成 ${OUTPUT_PATH}（来源目录：${ICON_SRC_DIR}）"
