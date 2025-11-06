@@ -67,11 +67,12 @@ write_icon() {
     local target="$2"
     local candidate="$ICON_SRC_DIR/${dimension}.png"
 
+    local source="$BASE_ICON"
     if [ -f "$candidate" ]; then
-        cp "$candidate" "$ICONSET_DIR/$target"
-    else
-        sips -s format png -z "$dimension" "$dimension" "$BASE_ICON" --out "$ICONSET_DIR/$target" >/dev/null
+        source="$candidate"
     fi
+
+    sips -s format png -z "$dimension" "$dimension" "$source" --out "$ICONSET_DIR/$target" >/dev/null
 }
 
 write_icon 16   icon_16x16.png
