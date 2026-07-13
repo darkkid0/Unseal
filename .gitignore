@@ -62,3 +62,6 @@ fastlane/screenshots/**/*.png
 fastlane/test_output
 /.cache
 /.spec-workflow
+AGENTS.md
+CLAUDE.md
+/.claude
