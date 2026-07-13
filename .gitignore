@@ -65,3 +65,5 @@ fastlane/test_output
 AGENTS.md
 CLAUDE.md
 /.claude
+/.codex
+/.planning

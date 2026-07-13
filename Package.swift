@@ -23,8 +23,8 @@ let package = Package(
                 "UnsealCore"
             ],
             path: "Sources/AppModule",
-            resources: [
-                .process("Resources")
+            exclude: [
+                "Resources"
             ]
         ),
         .testTarget(
@@ -33,6 +33,14 @@ let package = Package(
                 "UnsealCore"
             ],
             path: "Tests/UnsealCoreTests"
+        ),
+        .testTarget(
+            name: "AppModuleTests",
+            dependencies: [
+                "AppModule",
+                "UnsealCore"
+            ],
+            path: "Tests/AppModuleTests"
         )
     ]
 )

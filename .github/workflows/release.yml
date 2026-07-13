@@ -1,0 +1,211 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unseal-release-${{ github.event_name }}-${{ github.ref_name }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Test, package, and release
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: metadata
+        env:
+          MANUAL_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            release_tag="$MANUAL_TAG"
+          else
+            release_tag="$GITHUB_REF_NAME"
+          fi
+
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must use the form vMAJOR.MINOR.PATCH." >&2
+            exit 1
+          fi
+
+          version="${release_tag#v}"
+          archive="Unseal-${version}-macOS-universal.zip"
+          {
+            echo "tag=$release_tag"
+            echo "version=$version"
+            echo "archive=$archive"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Run tests
+        run: swift test
+
+      - name: Configure Apple signing and notarization
+        id: signing
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+
+          secret_names=(
+            APPLE_CERTIFICATE_P12_BASE64
+            APPLE_CERTIFICATE_PASSWORD
+            APPLE_SIGNING_IDENTITY
+            APPLE_NOTARY_KEY_P8_BASE64
+            APPLE_NOTARY_KEY_ID
+            APPLE_NOTARY_ISSUER_ID
+          )
+          configured=0
+          missing=0
+
+          for secret_name in "${secret_names[@]}"; do
+            if [[ -n "${!secret_name}" ]]; then
+              configured=$((configured + 1))
+            else
+              echo "Missing optional secret: $secret_name"
+              missing=$((missing + 1))
+            fi
+          done
+
+          if [[ "$configured" -eq 0 ]]; then
+            echo "No Apple signing secrets configured; creating an ad-hoc signed release."
+            echo "SIGNING_ENABLED=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [[ "$missing" -ne 0 ]]; then
+            echo "Apple release secrets are only partially configured." >&2
+            exit 1
+          fi
+
+          keychain_path="$RUNNER_TEMP/unseal-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          certificate_path="$RUNNER_TEMP/unseal-release.p12"
+          notary_key_path="$RUNNER_TEMP/AuthKey.p8"
+          notary_profile="unseal-notary"
+          echo "BUILD_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
+
+          printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 -D > "$certificate_path"
+          printf '%s' "$APPLE_NOTARY_KEY_P8_BASE64" | base64 -D > "$notary_key_path"
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+
+          xcrun notarytool store-credentials "$notary_profile" \
+            --key "$notary_key_path" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --keychain "$keychain_path" \
+            --validate
+
+          {
+            echo "SIGNING_ENABLED=true"
+            echo "SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+            echo "NOTARYTOOL_PROFILE=$notary_profile"
+            echo "NOTARYTOOL_KEYCHAIN=$keychain_path"
+          } >> "$GITHUB_ENV"
+
+      - name: Build universal application
+        env:
+          MARKETING_VERSION: ${{ steps.metadata.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: ./package_app.sh
+
+      - name: Verify application
+        run: |
+          set -euo pipefail
+          app_path=".build/release/Unseal.app"
+
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          architectures="$(lipo -archs "$app_path/Contents/MacOS/Unseal")"
+          [[ "$architectures" == *arm64* ]]
+          [[ "$architectures" == *x86_64* ]]
+
+          if [[ "${SIGNING_ENABLED:-false}" == "true" ]]; then
+            xcrun stapler validate "$app_path"
+            spctl --assess --type execute --verbose=4 "$app_path"
+          fi
+
+      - name: Create release archive
+        env:
+          ARCHIVE_NAME: ${{ steps.metadata.outputs.archive }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent \
+            .build/release/Unseal.app \
+            "dist/$ARCHIVE_NAME"
+          shasum -a 256 "dist/$ARCHIVE_NAME" > "dist/$ARCHIVE_NAME.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Unseal-${{ steps.metadata.outputs.version }}-macOS-universal
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "Unseal $RELEASE_VERSION" \
+              --generate-notes
+          fi
+
+      - name: Clean up signing material
+        if: always()
+        run: |
+          if [[ -n "${BUILD_KEYCHAIN:-}" && -f "$BUILD_KEYCHAIN" ]]; then
+            security delete-keychain "$BUILD_KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/unseal-release.p12" "$RUNNER_TEMP/AuthKey.p8"

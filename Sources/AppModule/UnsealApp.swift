@@ -8,6 +8,7 @@ struct UnsealApp: App {
         Settings {
             SettingsView()
                 .environmentObject(appDelegate.appModel)
+                .environmentObject(appDelegate.launchAtLoginController)
         }
     }
 }

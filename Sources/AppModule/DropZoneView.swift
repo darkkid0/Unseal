@@ -31,8 +31,11 @@ struct DropZoneView: View {
         .animation(.easeInOut(duration: 0.2), value: model.dropStatus)
         .animation(.easeInOut(duration: 0.2), value: isTargeted)
         .dropDestination(for: URL.self, action: { urls, _ in
-            let apps = urls.filter { $0.pathExtension == "app" }
-            guard !apps.isEmpty else { return false }
+            let apps = urls.filter {
+                $0.isFileURL &&
+                    $0.pathExtension.caseInsensitiveCompare("app") == .orderedSame
+            }
+            guard model.canAcceptDrop, !apps.isEmpty else { return false }
             model.handleDrop(urls: apps)
             return true
         }, isTargeted: { hovering in
@@ -82,7 +85,7 @@ struct DropZoneView: View {
     private var statusDescription: String {
         switch model.dropStatus {
         case .idle:
-            return "将显示“已损坏”的应用从访达拖到此处，自动移除隔离标记。"
+            return "将来源可信的受限应用从访达拖到此处，仅移除其隔离标记。"
         case .processing:
             return "正在移除隔离标记并验证 Gatekeeper。"
         case .success:
