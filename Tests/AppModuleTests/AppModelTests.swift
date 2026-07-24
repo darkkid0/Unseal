@@ -24,6 +24,38 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.dropStatus, .success(firstURL))
     }
 
+    func testMultipleAppsInOneDropAreRejectedWithoutRepair() {
+        let service = ControlledRepairService()
+        let model = AppModel(service: service)
+        let firstURL = URL(fileURLWithPath: "/Applications/First.app")
+        let secondURL = URL(fileURLWithPath: "/Applications/Second.app")
+
+        model.handleDrop(urls: [firstURL, secondURL])
+
+        XCTAssertTrue(service.requestedURLs.isEmpty)
+        guard case let .failure(url, info) = model.dropStatus else {
+            return XCTFail("Expected multi-drop failure")
+        }
+        XCTAssertEqual(url, firstURL)
+        XCTAssertEqual(info.title, "一次只能处理一个项目")
+        XCTAssertTrue(model.canClearRecords)
+        XCTAssertNotNil(model.lastDiagnostic)
+    }
+
+    func testDiskImageDropIsAccepted() async {
+        let service = ControlledRepairService()
+        let model = AppModel(service: service)
+        let dmgURL = URL(fileURLWithPath: "/Users/test/Downloads/Kooky.dmg")
+
+        model.handleDrop(urls: [dmgURL])
+        XCTAssertEqual(service.requestedURLs, [dmgURL])
+        XCTAssertTrue(model.isProcessing)
+
+        service.completeNext(with: .success)
+        await Task.yield()
+        XCTAssertEqual(model.dropStatus, .success(dmgURL))
+    }
+
     func testClearIsDisabledDuringRepairAndEnabledAfterCompletion() async {
         let service = ControlledRepairService()
         let model = AppModel(service: service)

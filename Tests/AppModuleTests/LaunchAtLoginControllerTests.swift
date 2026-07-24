@@ -5,16 +5,28 @@ import XCTest
 
 @MainActor
 final class LaunchAtLoginControllerTests: XCTestCase {
-    func testFirstLaunchEnablesLoginItemByDefault() {
+    func testFirstLaunchDoesNotEnableLoginItemByDefault() {
         let manager = FakeLaunchAtLoginManager(status: .disabled)
         let defaults = makeDefaults()
         let controller = LaunchAtLoginController(manager: manager, defaults: defaults)
 
         controller.activateIfNeeded()
 
+        XCTAssertEqual(manager.registerCallCount, 0)
+        XCTAssertFalse(controller.isEnabled)
+        XCTAssertFalse(defaults.bool(forKey: LaunchAtLoginController.preferenceKey))
+    }
+
+    func testStoredEnabledPreferenceRegistersOnActivate() {
+        let manager = FakeLaunchAtLoginManager(status: .disabled)
+        let defaults = makeDefaults()
+        defaults.set(true, forKey: LaunchAtLoginController.preferenceKey)
+        let controller = LaunchAtLoginController(manager: manager, defaults: defaults)
+
+        controller.activateIfNeeded()
+
         XCTAssertEqual(manager.registerCallCount, 1)
         XCTAssertTrue(controller.isEnabled)
-        XCTAssertTrue(defaults.bool(forKey: LaunchAtLoginController.preferenceKey))
     }
 
     func testStoredDisabledPreferenceIsRespected() {
@@ -31,7 +43,9 @@ final class LaunchAtLoginControllerTests: XCTestCase {
 
     func testSystemApprovalIsNotForcedAndOpensSettings() {
         let manager = FakeLaunchAtLoginManager(status: .requiresApproval)
-        let controller = LaunchAtLoginController(manager: manager, defaults: makeDefaults())
+        let defaults = makeDefaults()
+        defaults.set(true, forKey: LaunchAtLoginController.preferenceKey)
+        let controller = LaunchAtLoginController(manager: manager, defaults: defaults)
 
         controller.activateIfNeeded()
         controller.openSystemSettings()
@@ -52,6 +66,7 @@ final class LaunchAtLoginControllerTests: XCTestCase {
         XCTAssertEqual(manager.unregisterCallCount, 1)
         XCTAssertFalse(controller.isEnabled)
         XCTAssertFalse(defaults.bool(forKey: LaunchAtLoginController.preferenceKey))
+        XCTAssertTrue(defaults.bool(forKey: LaunchAtLoginController.consentKey))
     }
 
     func testNotFoundMainAppServiceUsesLaunchAgentFallback() throws {
@@ -77,7 +92,8 @@ final class LaunchAtLoginControllerTests: XCTestCase {
                 format: nil
             ) as? [String: Any]
         )
-        XCTAssertEqual(propertyList["Label"] as? String, LaunchAgentLoginItem.label)
+        XCTAssertEqual(propertyList["Label"] as? String, fallback.label)
+        XCTAssertEqual(fallback.label, "io.github.darkkid0.Unseal.login-item")
 
         try manager.unregister()
         XCTAssertFalse(fallback.plistExists)
@@ -101,6 +117,30 @@ final class LaunchAtLoginControllerTests: XCTestCase {
         XCTAssertEqual(manager.status, .enabled)
     }
 
+    func testEnabledSMAppServiceMigratesAwayFromLaunchAgent() throws {
+        let fallback = try makeLaunchAgentLoginItem()
+        try fallback.register()
+        XCTAssertTrue(fallback.isRegistered)
+
+        let appService = FakeMainAppLoginItem(status: .enabled)
+        let manager = SystemLaunchAtLoginManager(
+            appService: appService,
+            fallback: fallback
+        )
+
+        XCTAssertEqual(manager.status, .enabled)
+        XCTAssertFalse(fallback.isRegistered)
+    }
+
+    func testLaunchAgentLabelDerivesFromBundleIdentifier() throws {
+        let item = try makeLaunchAgentLoginItem(
+            bundleIdentifier: "com.example.CustomUnseal"
+        )
+        try item.register()
+        XCTAssertEqual(item.label, "com.example.CustomUnseal.login-item")
+        XCTAssertTrue(item.isRegistered)
+    }
+
     private func makeDefaults() -> UserDefaults {
         let suiteName = "LaunchAtLoginControllerTests-\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
@@ -111,7 +151,9 @@ final class LaunchAtLoginControllerTests: XCTestCase {
         return defaults
     }
 
-    private func makeLaunchAgentLoginItem() throws -> LaunchAgentLoginItem {
+    private func makeLaunchAgentLoginItem(
+        bundleIdentifier: String = "io.github.darkkid0.Unseal"
+    ) throws -> LaunchAgentLoginItem {
         let rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("LaunchAgentTests-\(UUID().uuidString)", isDirectory: true)
         let bundleURL = rootURL.appendingPathComponent("Unseal.app", isDirectory: true)
@@ -123,7 +165,8 @@ final class LaunchAtLoginControllerTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: rootURL) }
         return LaunchAgentLoginItem(
             bundleURL: bundleURL,
-            launchAgentsDirectory: launchAgentsURL
+            launchAgentsDirectory: launchAgentsURL,
+            bundleIdentifier: bundleIdentifier
         )
     }
 }

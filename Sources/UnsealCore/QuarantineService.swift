@@ -1,168 +1,20 @@
-import Darwin
 import Foundation
 
-public protocol CommandRunning: Sendable {
-    func run(command: String, arguments: [String]) -> CommandResult
-}
-
-public struct CommandResult: Sendable {
-    public let terminationStatus: Int32
-    public let standardOutput: String
-    public let standardError: String
-
-    public init(
-        terminationStatus: Int32,
-        standardOutput: String,
-        standardError: String
-    ) {
-        self.terminationStatus = terminationStatus
-        self.standardOutput = standardOutput
-        self.standardError = standardError
-    }
-
-    public var succeeded: Bool {
-        terminationStatus == 0
-    }
-}
-
-public final class SystemCommandRunner: CommandRunning, @unchecked Sendable {
-    private let timeout: TimeInterval
-
-    public init(timeout: TimeInterval = 30) {
-        self.timeout = timeout
-    }
-
-    public func run(command: String, arguments: [String]) -> CommandResult {
-        Self.runSync(command: command, arguments: arguments, timeout: timeout)
-    }
-
-    public static func runSync(
-        command: String,
-        arguments: [String],
-        timeout: TimeInterval = 30
-    ) -> CommandResult {
-        let fileManager = FileManager.default
-        let captureDirectory = fileManager.temporaryDirectory
-            .appendingPathComponent("Unseal-\(UUID().uuidString)", isDirectory: true)
-        let standardOutputURL = captureDirectory.appendingPathComponent("stdout")
-        let standardErrorURL = captureDirectory.appendingPathComponent("stderr")
-
-        do {
-            try fileManager.createDirectory(
-                at: captureDirectory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-        } catch {
-            return CommandResult(
-                terminationStatus: -1,
-                standardOutput: "",
-                standardError: "无法创建命令输出目录：\(error.localizedDescription)"
-            )
-        }
-        defer { try? fileManager.removeItem(at: captureDirectory) }
-
-        let privateFileAttributes: [FileAttributeKey: Any] = [.posixPermissions: 0o600]
-        guard fileManager.createFile(
-            atPath: standardOutputURL.path,
-            contents: nil,
-            attributes: privateFileAttributes
-        ), fileManager.createFile(
-            atPath: standardErrorURL.path,
-            contents: nil,
-            attributes: privateFileAttributes
-        ) else {
-            return CommandResult(
-                terminationStatus: -1,
-                standardOutput: "",
-                standardError: "无法创建命令输出文件。"
-            )
-        }
-
-        let standardOutputHandle: FileHandle
-        let standardErrorHandle: FileHandle
-        do {
-            standardOutputHandle = try FileHandle(forWritingTo: standardOutputURL)
-            standardErrorHandle = try FileHandle(forWritingTo: standardErrorURL)
-        } catch {
-            return CommandResult(
-                terminationStatus: -1,
-                standardOutput: "",
-                standardError: "无法打开命令输出文件：\(error.localizedDescription)"
-            )
-        }
-        defer {
-            try? standardOutputHandle.close()
-            try? standardErrorHandle.close()
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: command)
-        process.arguments = arguments
-        process.standardOutput = standardOutputHandle
-        process.standardError = standardErrorHandle
-
-        let finished = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in finished.signal() }
-
-        do {
-            try process.run()
-        } catch {
-            return CommandResult(
-                terminationStatus: -1,
-                standardOutput: "",
-                standardError: error.localizedDescription
-            )
-        }
-
-        let effectiveTimeout = max(timeout, 0.1)
-        let didTimeOut = finished.wait(timeout: .now() + effectiveTimeout) == .timedOut
-        if didTimeOut, process.isRunning {
-            process.terminate()
-            if finished.wait(timeout: .now() + 1) == .timedOut, process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
-                _ = finished.wait(timeout: .now() + 1)
-            }
-        }
-
-        try? standardOutputHandle.synchronize()
-        try? standardErrorHandle.synchronize()
-        try? standardOutputHandle.close()
-        try? standardErrorHandle.close()
-
-        let output = readOutput(at: standardOutputURL)
-        let errorOutput = readOutput(at: standardErrorURL)
-
-        if didTimeOut {
-            let timeoutMessage = "命令执行超过 \(effectiveTimeout.formatted()) 秒，已终止。"
-            let combinedError = errorOutput.isEmpty
-                ? timeoutMessage
-                : "\(errorOutput.trimmingCharacters(in: .whitespacesAndNewlines))\n\(timeoutMessage)"
-            return CommandResult(
-                terminationStatus: 124,
-                standardOutput: output,
-                standardError: combinedError
-            )
-        }
-
-        return CommandResult(
-            terminationStatus: process.terminationStatus,
-            standardOutput: output,
-            standardError: errorOutput
-        )
-    }
-
-    private static func readOutput(at url: URL) -> String {
-        guard let data = try? Data(contentsOf: url) else { return "" }
-        return String(data: data, encoding: .utf8) ?? ""
-    }
-}
-
 public enum RepairResult: Sendable {
+    /// Quarantine was removed from an app/dmg, or a DMG app was installed after clearing quarantine.
     case success
     case failure(DiagnosticInfo)
 }
 
+/// Removes `com.apple.quarantine` from a user-selected `.app` or `.dmg`.
+///
+/// For `.dmg` files the quarantine is usually on the image itself (not the nested `.app`).
+/// Unseal clears the image attribute, mounts it, installs the app to Applications, and
+/// clears quarantine on the installed copy — matching the real-world “download DMG → damaged”
+/// workflow.
+///
+/// Gatekeeper signature rejection alone is not a failure after quarantine is cleared.
+/// `repair` retains the service until the completion handler is invoked.
 public protocol QuarantineRepairing: Sendable {
     func repair(appURL: URL, completion: @escaping @Sendable (RepairResult) -> Void)
 }
@@ -173,158 +25,228 @@ public final class QuarantineService: QuarantineRepairing, @unchecked Sendable {
         qos: .userInitiated
     )
     private let runner: any CommandRunning
+    private let validator: AppBundleValidator
+    private let attributes: QuarantineAttributeClient
+    private let assessor: GatekeeperAssessor
+    private let diskImages: DiskImageService
 
     public init(runner: any CommandRunning = SystemCommandRunner()) {
         self.runner = runner
+        self.validator = AppBundleValidator()
+        self.attributes = QuarantineAttributeClient(runner: runner)
+        self.assessor = GatekeeperAssessor(runner: runner)
+        self.diskImages = DiskImageService(runner: runner)
     }
 
     public func repair(appURL: URL, completion: @escaping @Sendable (RepairResult) -> Void) {
-        queue.async { [weak self] in
-            guard let self else { return }
-
-            if let validationFailure = self.validationFailure(for: appURL) {
-                completion(.failure(validationFailure))
-                return
-            }
-
-            let hadQuarantineAttribute = self.hasQuarantineAttribute(appURL: appURL)
-            if hadQuarantineAttribute {
-                let xattrResult = self.runner.run(
-                    command: "/usr/bin/xattr",
-                    arguments: ["-dr", "com.apple.quarantine", appURL.path]
-                )
-
-                if !xattrResult.succeeded {
-                    let info = DiagnosticInfo(
-                        title: "移除隔离标记失败",
-                        message: "仅删除 com.apple.quarantine 时出现错误，其他扩展属性未被修改。",
-                        command: "xattr -dr com.apple.quarantine \(appURL.path.shellQuoted)",
-                        output: xattrResult.standardError.ifEmpty(
-                            fallback: xattrResult.standardOutput
-                        ),
-                        suggestions: [
-                            "确认应用包未被其他进程占用。",
-                            "检查应用所在目录是否允许当前用户修改。",
-                            "重新下载可信来源的应用后再次尝试。"
-                        ]
-                    )
-                    completion(.failure(info))
-                    return
-                }
-            }
-
-            let assessment = self.assess(appURL: appURL)
-            switch assessment.status {
-            case .clean:
-                completion(.success)
-            case .blocked:
-                let info = DiagnosticInfo(
-                    title: "Gatekeeper 仍然阻止此应用",
-                    message: "隔离标记未能完全移除，系统仍拒绝运行此应用。",
-                    command: "spctl --assess --type execute \(appURL.path.shellQuoted)",
-                    output: assessment.details,
-                    suggestions: [
-                        "确认应用来自可信来源后重新下载。",
-                        "在“系统设置 > 隐私与安全”中查看系统给出的具体原因。",
-                        "不要继续运行签名损坏或来源不明的应用。"
-                    ]
-                )
-                completion(.failure(info))
-            case .unknown:
-                let message = hadQuarantineAttribute
-                    ? "隔离标记已处理，但 Gatekeeper 仍未接受此应用，可能存在签名或完整性问题。"
-                    : "未检测到可移除的隔离标记，Gatekeeper 拒绝可能由签名或完整性问题导致。"
-                let info = DiagnosticInfo(
-                    title: "无法解除应用限制",
-                    message: message,
-                    command: "spctl --assess --type execute \(appURL.path.shellQuoted)",
-                    output: assessment.details,
-                    suggestions: [
-                        "优先从开发者官网或 App Store 重新下载。",
-                        "核对开发者签名与下载来源。",
-                        "不要通过关闭系统安全功能来强行运行。"
-                    ]
-                )
-                completion(.failure(info))
-            }
+        queue.async {
+            completion(self.performRepair(itemURL: appURL))
         }
     }
 
     public func assess(appURL: URL) async -> QuarantineAssessment {
         await withCheckedContinuation { continuation in
-            queue.async { [weak self] in
-                guard let self else {
-                    continuation.resume(
-                        returning: QuarantineAssessment(status: .unknown, details: "服务已释放")
-                    )
-                    return
-                }
-                continuation.resume(returning: self.assess(appURL: appURL))
+            queue.async {
+                continuation.resume(returning: self.assessor.assess(appURL: appURL))
             }
         }
     }
 
-    private func assess(appURL: URL) -> QuarantineAssessment {
-        let command = "/usr/sbin/spctl"
-        let arguments = ["--assess", "--type", "execute", appURL.path]
-        let result = runner.run(command: command, arguments: arguments)
+    private func performRepair(itemURL: URL) -> RepairResult {
+        let targetURL = itemURL.standardizedFileURL
+        let ext = targetURL.pathExtension.lowercased()
 
-        if result.succeeded {
-            return QuarantineAssessment(status: .clean, details: result.standardOutput)
+        if ext == "dmg" {
+            return repairDiskImage(dmgURL: targetURL)
         }
 
-        let errorMessage = result.standardError.ifEmpty(fallback: result.standardOutput)
-        if hasQuarantineAttribute(appURL: appURL) {
-            return QuarantineAssessment(status: .blocked, details: errorMessage)
+        return repairApplication(appURL: targetURL)
+    }
+
+    private func repairApplication(appURL: URL) -> RepairResult {
+        if let validationFailure = validator.validationFailure(for: appURL) {
+            return .failure(validationFailure)
         }
 
-        return QuarantineAssessment(status: .unknown, details: errorMessage)
+        return clearQuarantineOrExplain(at: appURL, kind: .application)
     }
 
-    private func hasQuarantineAttribute(appURL: URL) -> Bool {
-        let result = runner.run(
-            command: "/usr/bin/xattr",
-            arguments: ["-p", "com.apple.quarantine", appURL.path]
-        )
-        return result.succeeded
-    }
+    private func repairDiskImage(dmgURL: URL) -> RepairResult {
+        if let validationFailure = diskImages.validationFailure(for: dmgURL) {
+            return .failure(validationFailure)
+        }
 
-    private func validationFailure(for appURL: URL) -> DiagnosticInfo? {
-        var isDirectory = ObjCBool(false)
-        let exists = FileManager.default.fileExists(
-            atPath: appURL.path,
-            isDirectory: &isDirectory
-        )
-        let values = try? appURL.resourceValues(forKeys: [.isSymbolicLinkKey])
-        let isApplication = appURL.pathExtension.caseInsensitiveCompare("app") == .orderedSame
-
-        guard appURL.isFileURL,
-              exists,
-              isDirectory.boolValue,
-              isApplication,
-              values?.isSymbolicLink != true else {
-            return DiagnosticInfo(
-                title: "无效的应用包",
-                message: "Unseal 仅处理本机文件系统中真实存在且不是符号链接的 .app 应用包。",
-                command: "检查 \(appURL.path.shellQuoted)",
-                output: appURL.path,
-                suggestions: [
-                    "请直接从访达拖入完整的 .app 应用包。",
-                    "不要拖入应用内部文件、快捷方式或符号链接。"
-                ]
+        // Quarantine almost always sits on the .dmg from the browser download.
+        if case let .failed(result) = attributes.probe(appURL: dmgURL) {
+            return .failure(
+                DiagnosticInfo(
+                    title: "无法读取隔离标记",
+                    message: "探测磁盘镜像的 com.apple.quarantine 失败，未修改文件。",
+                    command: "xattr -p com.apple.quarantine \(dmgURL.path.shellQuoted)",
+                    output: result.combinedOutput,
+                    suggestions: [
+                        "确认对该 .dmg 有读写权限。",
+                        "在终端手动执行上述命令查看具体错误。"
+                    ]
+                )
             )
         }
 
-        return nil
-    }
-}
+        let dmgRemove = attributes.remove(appURL: dmgURL)
+        if !dmgRemove.succeeded,
+           !QuarantineAttributeClient.isMissingAttribute(result: dmgRemove) {
+            return .failure(
+                DiagnosticInfo(
+                    title: "移除磁盘镜像隔离标记失败",
+                    message: "无法从 .dmg 删除 com.apple.quarantine。",
+                    command: "xattr -dr com.apple.quarantine \(dmgURL.path.shellQuoted)",
+                    output: dmgRemove.combinedOutput,
+                    suggestions: [
+                        "确认文件未被占用，且当前用户可修改「下载」目录中的文件。"
+                    ]
+                )
+            )
+        }
 
-private extension String {
-    func ifEmpty(fallback: String) -> String {
-        isEmpty ? fallback : self
+        // Install must run while the image is still mounted.
+        let mountResult = diskImages.withMountedImage(dmgURL: dmgURL) { mountPoint -> RepairResult in
+            let apps = diskImages.findApplicationBundles(in: mountPoint)
+            if apps.isEmpty {
+                return .failure(
+                    DiagnosticInfo(
+                        title: "镜像中未找到应用",
+                        message: "已清除 .dmg 隔离标记并完成挂载，但未在卷根目录发现 .app。",
+                        command: "hdiutil attach \(dmgURL.path.shellQuoted)",
+                        output: dmgURL.path,
+                        suggestions: [
+                            "打开镜像确认应用是否在子文件夹中，若是请直接拖入该 .app。",
+                            "部分软件需要先运行安装包（.pkg），Unseal 不处理安装器。"
+                        ]
+                    )
+                )
+            }
+
+            if apps.count > 1 {
+                let names = apps.map(\.lastPathComponent).joined(separator: "\n")
+                return .failure(
+                    DiagnosticInfo(
+                        title: "镜像中有多个应用",
+                        message: "检测到 \(apps.count) 个 .app。请打开镜像后单独拖入要处理的应用。",
+                        command: "列出 \(dmgURL.lastPathComponent)",
+                        output: names,
+                        suggestions: [
+                            "双击 .dmg 打开，将需要的 .app 拖到应用程序文件夹，再拖入 Unseal。"
+                        ]
+                    )
+                )
+            }
+
+            let sourceApp = apps[0]
+            // Nested app on a read-only volume often has no quarantine; the dmg did.
+            // Install to a writable location and clear attributes on the copy.
+            switch diskImages.installApplication(from: sourceApp) {
+            case let .failure(info):
+                return .failure(info)
+            case let .success(installed):
+                let clear = attributes.remove(appURL: installed)
+                if !clear.succeeded,
+                   !QuarantineAttributeClient.isMissingAttribute(result: clear) {
+                    return .failure(
+                        DiagnosticInfo(
+                            title: "已安装但未能清除隔离标记",
+                            message: "应用已复制到 \(installed.path)，但清除隔离标记失败。",
+                            command: "xattr -dr com.apple.quarantine \(installed.path.shellQuoted)",
+                            output: clear.combinedOutput,
+                            suggestions: [
+                                "在终端执行上述命令，或将应用拖入 Unseal 再试一次。"
+                            ]
+                        )
+                    )
+                }
+                return .success
+            }
+        }
+
+        switch mountResult {
+        case let .failure(info):
+            return .failure(info)
+        case let .success(repairResult):
+            return repairResult
+        }
     }
 
-    var shellQuoted: String {
-        "'" + replacingOccurrences(of: "'", with: "'\\''") + "'"
+    private enum TargetKind {
+        case application
+    }
+
+    private func clearQuarantineOrExplain(at targetURL: URL, kind _: TargetKind) -> RepairResult {
+        let probe = attributes.probe(appURL: targetURL)
+        let hadQuarantine: Bool
+        switch probe {
+        case .present:
+            hadQuarantine = true
+        case .absent:
+            hadQuarantine = attributes.hasQuarantineAnywhere(appURL: targetURL)
+        case let .failed(result):
+            return .failure(
+                DiagnosticInfo(
+                    title: "无法读取隔离标记",
+                    message: "探测 com.apple.quarantine 失败，未修改应用包。",
+                    command: "xattr -p com.apple.quarantine \(targetURL.path.shellQuoted)",
+                    output: result.combinedOutput,
+                    suggestions: [
+                        "确认应用所在目录允许当前用户读取扩展属性。",
+                        "在终端手动执行上述命令以查看具体错误。",
+                        "解决权限或文件系统问题后重试。"
+                    ]
+                )
+            )
+        }
+
+        if hadQuarantine {
+            let removeResult = attributes.remove(appURL: targetURL)
+            if !removeResult.succeeded {
+                return .failure(
+                    DiagnosticInfo(
+                        title: "移除隔离标记失败",
+                        message: "仅删除 com.apple.quarantine 时出现错误，其他扩展属性未被修改。",
+                        command: "xattr -dr com.apple.quarantine \(targetURL.path.shellQuoted)",
+                        output: removeResult.combinedOutput,
+                        suggestions: [
+                            "确认应用包未被其他进程占用。",
+                            "检查应用所在目录是否允许当前用户修改。",
+                            "若应用仍在只读磁盘镜像中，请先复制到应用程序文件夹，或直接拖入 .dmg。",
+                            "重新下载可信来源的应用后再次尝试。"
+                        ]
+                    )
+                )
+            }
+            return .success
+        }
+
+        let assessment = assessor.assess(appURL: targetURL)
+        switch assessment.status {
+        case .clean:
+            return .success
+        case .blocked, .unknown:
+            return .failure(
+                DiagnosticInfo(
+                    title: "不是隔离标记问题",
+                    message: """
+                    未检测到 com.apple.quarantine。Unseal 只能移除隔离标记，无法修复签名、公证或完整性问题。\
+                    若你拖入的是磁盘镜像里的 .app：隔离标记通常在 .dmg 上，请改为拖入 .dmg 本身。\
+                    本机 ad-hoc 签名应用在 Gatekeeper 评估中常会显示 rejected。
+                    """,
+                    command: "spctl --assess --type execute \(targetURL.path.shellQuoted)",
+                    output: assessment.details,
+                    suggestions: [
+                        "下载的安装包请直接拖入 .dmg（不要只拖镜像里的 .app）。",
+                        "已安装的应用可先确认是否仍带隔离标记：xattr -l 应用路径。",
+                        "ad-hoc / 未签名应用可尝试：右键应用 → 打开（仅限可信来源）。",
+                        "Unseal 不会关闭系统安全策略，也不会伪造开发者签名。"
+                    ]
+                )
+            )
+        }
     }
 }

@@ -7,8 +7,8 @@ Unseal 是一款 Swift/SwiftUI 编写的 macOS 菜单栏小工具，专为“应
 
 ## 功能亮点
 - **菜单栏常驻**：点击图标即可呼出拖拽面板，界面简洁清晰。
-- **登录自动启动**：首次运行默认注册为登录项，也可随时在面板或设置中关闭。
-- **拖拽修复**：支持从访达拖入 `.app` 包触发一次性修复流程。
+- **登录自动启动**：默认关闭，可在面板或设置中按需开启；正式签名包优先使用系统登录项，本地构建回退到 LaunchAgent。
+- **拖拽修复**：支持从访达拖入单个 `.app` 包触发修复；一次拖入多个应用时会明确提示并拒绝。
 - **诊断说明**：失败时展示执行命令及系统反馈，附带重试与操作建议。
 - **状态重置**：一键清空修复记录，恢复初始拖拽提示。
 - **零监听**：不后台扫描磁盘，仅在用户操作时运行命令，无额外数据收集。
@@ -58,7 +58,7 @@ swift run
    open /Applications/Unseal.app
    ```
 
-> 正式签名应用优先使用 macOS 登录项服务；本地/ad-hoc 构建使用 `~/Library/LaunchAgents` 回退。若用户曾在系统中禁用 Unseal，面板会引导至“系统设置 > 通用 > 登录项”重新允许。
+> 正式签名应用优先使用 macOS 登录项服务，并在可用时自动清理旧版 LaunchAgent；本地/ad-hoc 构建使用 `~/Library/LaunchAgents` 回退（标签由 Bundle ID 派生）。若用户曾在系统中禁用 Unseal，面板会引导至“系统设置 > 通用 > 登录项”重新允许。
 
 ## GitHub Actions 自动发布
 
@@ -121,10 +121,14 @@ Sources/
 │   ├── MenuContent.swift
 │   └── DropZoneView.swift
 └── UnsealCore/       # 命令执行与诊断逻辑
+    ├── CommandRunner.swift
+    ├── AppBundleValidator.swift
+    ├── QuarantineAttributeClient.swift
+    ├── GatekeeperAssessor.swift
     ├── QuarantineService.swift
     └── Diagnostics.swift
 Tests/
-├── UnsealCoreTests/  # 隔离属性、诊断、命令输出与超时测试
+├── UnsealCoreTests/  # 隔离属性、回滚、诊断、命令输出与超时测试
 └── AppModuleTests/   # UI 状态竞态与登录启动状态测试
 ```
 
@@ -135,10 +139,11 @@ swift test
 
 测试覆盖核心修复和常驻状态逻辑，包括：
 - 仅删除 `com.apple.quarantine`，并校验准确命令参数；
+- 探测失败与缺失属性的区分、评估失败后的标记回滚；
 - `spctl --assess` 成功、拒绝与签名异常诊断；
-- 命令输出收集与超时终止；
-- 处理中重复拖入、清空和过期回调保护；
-- 登录启动默认值、用户关闭与系统审批状态。
+- 命令输出收集、截断与超时终止；
+- 处理中重复拖入、多应用拖入拒绝、清空和过期回调保护；
+- 登录启动 opt-in 默认值、用户关闭、系统审批与 LaunchAgent 迁移。
 
 ## 权限说明
 - 默认无需“完全磁盘访问权限”即可处理当前用户有权修改的常规应用，Unseal 也不会主动申请该权限。

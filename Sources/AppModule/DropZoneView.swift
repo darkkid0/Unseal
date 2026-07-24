@@ -31,12 +31,9 @@ struct DropZoneView: View {
         .animation(.easeInOut(duration: 0.2), value: model.dropStatus)
         .animation(.easeInOut(duration: 0.2), value: isTargeted)
         .dropDestination(for: URL.self, action: { urls, _ in
-            let apps = urls.filter {
-                $0.isFileURL &&
-                    $0.pathExtension.caseInsensitiveCompare("app") == .orderedSame
-            }
-            guard model.canAcceptDrop, !apps.isEmpty else { return false }
-            model.handleDrop(urls: apps)
+            let items = urls.filter { AppModel.isRepairableItem($0) }
+            guard model.canAcceptDrop, !items.isEmpty else { return false }
+            model.handleDrop(urls: items)
             return true
         }, isTargeted: { hovering in
             isTargeted = hovering
@@ -72,26 +69,32 @@ struct DropZoneView: View {
     private var statusTitle: String {
         switch model.dropStatus {
         case .idle:
-            return "拖入受限制的应用"
+            return "拖入受限的 .app 或 .dmg"
         case let .processing(url):
-            return "正在修复 \(url.lastPathComponent)"
+            return "正在处理 \(url.lastPathComponent)"
         case let .success(url):
             return "\(url.lastPathComponent) 已解锁"
         case let .failure(url, _):
-            return "\(url.lastPathComponent) 修复失败"
+            return "\(url.lastPathComponent) 处理失败"
         }
     }
 
     private var statusDescription: String {
         switch model.dropStatus {
         case .idle:
-            return "将来源可信的受限应用从访达拖到此处，仅移除其隔离标记。"
-        case .processing:
-            return "正在移除隔离标记并验证 Gatekeeper。"
-        case .success:
-            return "您可以直接从 Launchpad 或访达启动该应用。"
+            return "拖入可信来源的 .app，或浏览器下载的 .dmg（隔离标记常在镜像上）。每次一个。"
+        case let .processing(url):
+            if url.pathExtension.lowercased() == "dmg" {
+                return "正在清除镜像隔离标记、挂载并安装应用…"
+            }
+            return "正在移除 com.apple.quarantine 隔离标记…"
+        case let .success(url):
+            if url.pathExtension.lowercased() == "dmg" {
+                return "已清除隔离标记，并将镜像中的应用安装到应用程序文件夹。可从启动台打开。"
+            }
+            return "隔离标记已处理。可从访达重新打开该应用（仅处理可信来源软件）。"
         case .failure:
-            return "查看下方诊断信息，可尝试重试或按照建议处理。"
+            return "查看下方诊断。Unseal 只处理隔离标记；.dmg 会安装其中的 .app，不能伪造签名。"
         }
     }
 

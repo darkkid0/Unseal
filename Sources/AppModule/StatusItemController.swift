@@ -8,43 +8,9 @@ final class StatusItemController: NSObject {
     private let launchAtLoginController: LaunchAtLoginController
     private let statusItem: NSStatusItem
     private let popover: NSPopover
+    private let contextMenu: NSMenu
+    private let clearMenuItem: NSMenuItem
     private var cancellables = Set<AnyCancellable>()
-    private lazy var contextMenu: NSMenu = {
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-
-        clearMenuItem = NSMenuItem(
-            title: "清空记录",
-            action: #selector(clearRecords(_:)),
-            keyEquivalent: ""
-        )
-        clearMenuItem?.target = self
-        clearMenuItem?.image = NSImage(
-            systemSymbolName: "trash.fill",
-            accessibilityDescription: "清空记录"
-        )?.withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
-        clearMenuItem?.image?.isTemplate = true
-        menu.addItem(clearMenuItem!)
-
-        menu.addItem(.separator())
-
-        let quitItem = NSMenuItem(
-            title: "退出软件",
-            action: #selector(quitApplication(_:)),
-            keyEquivalent: ""
-        )
-        quitItem.target = self
-        quitItem.image = NSImage(
-            systemSymbolName: "power.circle.fill",
-            accessibilityDescription: "退出软件"
-        )?.withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
-        quitItem.image?.isTemplate = true
-        menu.addItem(quitItem)
-
-        return menu
-    }()
-    private var clearMenuItem: NSMenuItem?
-    private var canClearRecords: Bool { appModel.canClearRecords }
 
     init(
         appModel: AppModel,
@@ -54,10 +20,45 @@ final class StatusItemController: NSObject {
         self.launchAtLoginController = launchAtLoginController
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         popover = NSPopover()
+
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let clearItem = NSMenuItem(
+            title: "清空记录",
+            action: #selector(clearRecords(_:)),
+            keyEquivalent: ""
+        )
+        clearItem.image = NSImage(
+            systemSymbolName: "trash.fill",
+            accessibilityDescription: "清空记录"
+        )?.withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
+        clearItem.image?.isTemplate = true
+        menu.addItem(clearItem)
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(
+            title: "退出软件",
+            action: #selector(quitApplication(_:)),
+            keyEquivalent: ""
+        )
+        quitItem.image = NSImage(
+            systemSymbolName: "power.circle.fill",
+            accessibilityDescription: "退出软件"
+        )?.withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
+        quitItem.image?.isTemplate = true
+        menu.addItem(quitItem)
+
+        contextMenu = menu
+        clearMenuItem = clearItem
         super.init()
+
+        clearMenuItem.target = self
+        quitItem.target = self
+        clearMenuItem.isEnabled = false
+
         configureStatusItem()
         configurePopover()
-        observePopoverContent()
+        observeModelState()
         updateContextMenuItems()
     }
 
@@ -117,12 +118,16 @@ final class StatusItemController: NSObject {
         )
     }
 
-    private func observePopoverContent() {
+    private func observeModelState() {
         appModel.$lastDiagnostic
-            .combineLatest(launchAtLoginController.$statusMessage)
+            .combineLatest(
+                launchAtLoginController.$statusMessage,
+                appModel.$dropStatus
+            )
             .receive(on: RunLoop.main)
-            .sink { [weak self] _, _ in
+            .sink { [weak self] _, _, _ in
                 self?.updatePopoverSize()
+                self?.updateContextMenuItems()
             }
             .store(in: &cancellables)
     }
@@ -152,7 +157,7 @@ final class StatusItemController: NSObject {
     }
 
     private func updateContextMenuItems() {
-        clearMenuItem?.isEnabled = canClearRecords
+        clearMenuItem.isEnabled = appModel.canClearRecords
     }
 
     @objc
@@ -208,7 +213,7 @@ private struct MenuContainerView: View {
     }
 }
 
-private enum MenuLayout {
+enum MenuLayout {
     static let width: CGFloat = 360
 
     static func height(

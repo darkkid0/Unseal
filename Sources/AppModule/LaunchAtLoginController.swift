@@ -44,14 +44,19 @@ struct SMMainAppLoginItem: MainAppLoginItemManaging {
 }
 
 struct LaunchAgentLoginItem {
-    static let label = "io.github.darkkid0.Unseal.login-item"
+    /// Historical hard-coded label used by earlier builds.
+    static let legacyLabel = "io.github.darkkid0.Unseal.login-item"
 
     private let bundleURL: URL
     private let launchAgentsDirectory: URL
     private let fileManager: FileManager
+    private let primaryLabel: String
+    private let knownLabels: [String]
+
+    var label: String { primaryLabel }
 
     var plistURL: URL {
-        launchAgentsDirectory.appendingPathComponent("\(Self.label).plist")
+        launchAgentsDirectory.appendingPathComponent("\(primaryLabel).plist")
     }
 
     var isAvailable: Bool {
@@ -60,36 +65,41 @@ struct LaunchAgentLoginItem {
     }
 
     var plistExists: Bool {
-        fileManager.fileExists(atPath: plistURL.path)
+        knownLabels.contains { label in
+            fileManager.fileExists(atPath: plistURL(for: label).path)
+        }
     }
 
     var isRegistered: Bool {
-        guard isAvailable,
-              let data = try? Data(contentsOf: plistURL),
-              let propertyList = try? PropertyListSerialization.propertyList(
-                  from: data,
-                  options: [],
-                  format: nil
-              ),
-              let dictionary = propertyList as? [String: Any],
-              dictionary["Label"] as? String == Self.label,
-              dictionary["RunAtLoad"] as? Bool == true,
-              let arguments = dictionary["ProgramArguments"] as? [String] else {
-            return false
-        }
-
-        return arguments == ["/usr/bin/open", "-g", bundleURL.path]
+        knownLabels.contains { isRegistered(label: $0) }
     }
 
     init(
         bundleURL: URL = Bundle.main.bundleURL,
         launchAgentsDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents", isDirectory: true),
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        bundleIdentifier: String? = Bundle.main.bundleIdentifier
     ) {
         self.bundleURL = bundleURL.standardizedFileURL.resolvingSymlinksInPath()
         self.launchAgentsDirectory = launchAgentsDirectory
         self.fileManager = fileManager
+
+        let resolvedIdentifier = bundleIdentifier?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let derivedLabel: String
+        if let resolvedIdentifier, !resolvedIdentifier.isEmpty {
+            derivedLabel = "\(resolvedIdentifier).login-item"
+        } else {
+            derivedLabel = Self.legacyLabel
+        }
+        self.primaryLabel = derivedLabel
+
+        var labels = [derivedLabel]
+        if derivedLabel != Self.legacyLabel {
+            labels.append(Self.legacyLabel)
+        }
+        self.knownLabels = labels
     }
 
     func register() throws {
@@ -97,8 +107,11 @@ struct LaunchAgentLoginItem {
             throw LaunchAtLoginError.applicationBundleUnavailable
         }
 
+        // Prefer a single authoritative plist derived from the bundle identifier.
+        try removeLegacyPlists(keeping: primaryLabel)
+
         let propertyList: [String: Any] = [
-            "Label": Self.label,
+            "Label": primaryLabel,
             "ProgramArguments": ["/usr/bin/open", "-g", bundleURL.path],
             "RunAtLoad": true,
             "LimitLoadToSessionType": "Aqua",
@@ -123,8 +136,56 @@ struct LaunchAgentLoginItem {
     }
 
     func unregister() throws {
-        guard plistExists else { return }
-        try fileManager.removeItem(at: plistURL)
+        var firstError: Error?
+        for label in knownLabels {
+            let url = plistURL(for: label)
+            guard fileManager.fileExists(atPath: url.path) else { continue }
+            do {
+                try fileManager.removeItem(at: url)
+            } catch {
+                if firstError == nil {
+                    firstError = error
+                }
+            }
+        }
+        if let firstError {
+            throw firstError
+        }
+    }
+
+    /// Removes LaunchAgent fallback entries once SMAppService owns login registration.
+    func migrateAwayIfPresent() {
+        try? unregister()
+    }
+
+    private func plistURL(for label: String) -> URL {
+        launchAgentsDirectory.appendingPathComponent("\(label).plist")
+    }
+
+    private func isRegistered(label: String) -> Bool {
+        guard isAvailable,
+              let data = try? Data(contentsOf: plistURL(for: label)),
+              let propertyList = try? PropertyListSerialization.propertyList(
+                  from: data,
+                  options: [],
+                  format: nil
+              ),
+              let dictionary = propertyList as? [String: Any],
+              dictionary["Label"] as? String == label,
+              dictionary["RunAtLoad"] as? Bool == true,
+              let arguments = dictionary["ProgramArguments"] as? [String] else {
+            return false
+        }
+
+        return arguments == ["/usr/bin/open", "-g", bundleURL.path]
+    }
+
+    private func removeLegacyPlists(keeping keepLabel: String) throws {
+        for label in knownLabels where label != keepLabel {
+            let url = plistURL(for: label)
+            guard fileManager.fileExists(atPath: url.path) else { continue }
+            try fileManager.removeItem(at: url)
+        }
     }
 }
 
@@ -150,20 +211,27 @@ struct SystemLaunchAtLoginManager: LaunchAtLoginManaging {
     }
 
     var status: LaunchAtLoginState {
-        if fallback.isRegistered {
-            return .enabled
-        }
-
         switch appService.status {
-        case .notRegistered:
-            return .disabled
         case .enabled:
+            // SMAppService is authoritative; drop any leftover LaunchAgent.
+            fallback.migrateAwayIfPresent()
             return .enabled
         case .requiresApproval:
             return .requiresApproval
+        case .notRegistered:
+            if fallback.isRegistered {
+                return .enabled
+            }
+            return .disabled
         case .notFound:
+            if fallback.isRegistered {
+                return .enabled
+            }
             return fallback.isAvailable ? .disabled : .unavailable
         @unknown default:
+            if fallback.isRegistered {
+                return .enabled
+            }
             return .unavailable
         }
     }
@@ -171,6 +239,7 @@ struct SystemLaunchAtLoginManager: LaunchAtLoginManaging {
     func register() throws {
         switch appService.status {
         case .enabled:
+            fallback.migrateAwayIfPresent()
             return
         case .requiresApproval:
             return
@@ -179,6 +248,7 @@ struct SystemLaunchAtLoginManager: LaunchAtLoginManaging {
         case .notRegistered:
             do {
                 try appService.register()
+                fallback.migrateAwayIfPresent()
             } catch {
                 guard fallback.isAvailable else { throw error }
                 try fallback.register()
@@ -189,15 +259,31 @@ struct SystemLaunchAtLoginManager: LaunchAtLoginManaging {
     }
 
     func unregister() throws {
-        try fallback.unregister()
+        var firstError: Error?
+
+        do {
+            try fallback.unregister()
+        } catch {
+            firstError = error
+        }
 
         switch appService.status {
         case .enabled, .requiresApproval:
-            try appService.unregister()
+            do {
+                try appService.unregister()
+            } catch {
+                if firstError == nil {
+                    firstError = error
+                }
+            }
         case .notRegistered, .notFound:
             break
         @unknown default:
             break
+        }
+
+        if let firstError {
+            throw firstError
         }
     }
 
@@ -212,6 +298,8 @@ final class LaunchAtLoginController: ObservableObject {
     @Published private(set) var statusMessage: String?
 
     static let preferenceKey = "LaunchAtLoginEnabled"
+    /// Tracks whether the user has made an explicit login-item choice.
+    static let consentKey = "LaunchAtLoginConsentRecorded"
 
     private let manager: any LaunchAtLoginManaging
     private let defaults: UserDefaults
@@ -234,8 +322,9 @@ final class LaunchAtLoginController: ObservableObject {
     }
 
     func activateIfNeeded() {
+        // Opt-in: do not register on first launch until the user enables the toggle.
         if defaults.object(forKey: Self.preferenceKey) == nil {
-            defaults.set(true, forKey: Self.preferenceKey)
+            defaults.set(false, forKey: Self.preferenceKey)
         }
 
         guard defaults.bool(forKey: Self.preferenceKey) else {
@@ -247,6 +336,7 @@ final class LaunchAtLoginController: ObservableObject {
     }
 
     func setEnabled(_ enabled: Bool) {
+        defaults.set(true, forKey: Self.consentKey)
         defaults.set(enabled, forKey: Self.preferenceKey)
 
         if enabled {

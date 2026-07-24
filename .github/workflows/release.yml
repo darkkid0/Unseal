@@ -30,7 +30,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve release metadata
+      - name: Resolve release metadata and pin source commit
         id: metadata
         env:
           MANUAL_TAG: ${{ inputs.tag }}
@@ -48,18 +48,38 @@ jobs:
             exit 1
           fi
 
+          git fetch --tags --force
+
+          if git rev-parse "refs/tags/${release_tag}" >/dev/null 2>&1; then
+            git checkout --force "refs/tags/${release_tag}"
+            release_sha="$(git rev-parse HEAD)"
+            tag_existed="true"
+          else
+            if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+              echo "Tag ${release_tag} was not found after fetch." >&2
+              exit 1
+            fi
+            release_sha="$(git rev-parse HEAD)"
+            tag_existed="false"
+            echo "Tag ${release_tag} does not exist yet; will create it at ${release_sha}."
+          fi
+
           version="${release_tag#v}"
           archive="Unseal-${version}-macOS-universal.zip"
           {
             echo "tag=$release_tag"
             echo "version=$version"
             echo "archive=$archive"
+            echo "sha=$release_sha"
+            echo "tag_existed=$tag_existed"
           } >> "$GITHUB_OUTPUT"
 
       - name: Show toolchain
         run: |
           xcodebuild -version
           swift --version
+          git rev-parse HEAD
+          echo "Release commit: ${{ steps.metadata.outputs.sha }}"
 
       - name: Run tests
         run: swift test
@@ -97,7 +117,7 @@ jobs:
           done
 
           if [[ "$configured" -eq 0 ]]; then
-            echo "No Apple signing secrets configured; creating an ad-hoc signed release."
+            echo "No Apple signing secrets configured; creating an ad-hoc signed development release."
             echo "SIGNING_ENABLED=false" >> "$GITHUB_ENV"
             exit 0
           fi
@@ -175,7 +195,16 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent \
             .build/release/Unseal.app \
             "dist/$ARCHIVE_NAME"
-          shasum -a 256 "dist/$ARCHIVE_NAME" > "dist/$ARCHIVE_NAME.sha256"
+          # Record basename only so `shasum -c` works next to downloaded assets.
+          (
+            cd dist
+            shasum -a 256 "$ARCHIVE_NAME" > "$ARCHIVE_NAME.sha256"
+          )
+          # Verify the downloaded-form layout before publishing.
+          (
+            cd dist
+            shasum -a 256 -c "$ARCHIVE_NAME.sha256"
+          )
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -190,16 +219,49 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
           RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+          RELEASE_SHA: ${{ steps.metadata.outputs.sha }}
+          TAG_EXISTED: ${{ steps.metadata.outputs.tag_existed }}
         run: |
           set -euo pipefail
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/* --clobber
+          if [[ "${SIGNING_ENABLED:-false}" == "true" ]]; then
+            release_title="Unseal $RELEASE_VERSION"
+            release_notes_args=(--generate-notes)
           else
+            release_title="Unseal $RELEASE_VERSION (ad-hoc development build)"
+            release_notes_args=(
+              --notes
+              "⚠️ **Ad-hoc signed development build** — not Developer ID signed or notarized.
+
+          Built from commit \`${RELEASE_SHA}\`. Prefer a fully signed release for production distribution."
+            )
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            existing_target="$(gh release view "$RELEASE_TAG" --json targetCommitish --jq .targetCommitish)"
+            if [[ -n "$existing_target" && "$existing_target" != "$RELEASE_SHA" && "$existing_target" != "$RELEASE_TAG" ]]; then
+              # Accept short SHAs / branch names that resolve to the pinned commit.
+              if ! git merge-base --is-ancestor "$RELEASE_SHA" "$existing_target" 2>/dev/null \
+                && [[ "$(git rev-parse "$existing_target" 2>/dev/null || true)" != "$RELEASE_SHA" ]]; then
+                echo "Refusing to overwrite release $RELEASE_TAG assets from a different commit." >&2
+                echo "Existing target: $existing_target" >&2
+                echo "Build commit: $RELEASE_SHA" >&2
+                exit 1
+              fi
+            fi
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            if [[ "${SIGNING_ENABLED:-false}" != "true" ]]; then
+              gh release edit "$RELEASE_TAG" --title "$release_title" "${release_notes_args[@]}"
+            fi
+          else
+            if [[ "$TAG_EXISTED" != "true" ]]; then
+              git tag -a "$RELEASE_TAG" "$RELEASE_SHA" -m "Unseal $RELEASE_VERSION"
+              git push origin "refs/tags/$RELEASE_TAG"
+            fi
             gh release create "$RELEASE_TAG" dist/* \
-              --target "$GITHUB_SHA" \
-              --title "Unseal $RELEASE_VERSION" \
-              --generate-notes
+              --target "$RELEASE_SHA" \
+              --title "$release_title" \
+              "${release_notes_args[@]}"
           fi
 
       - name: Clean up signing material

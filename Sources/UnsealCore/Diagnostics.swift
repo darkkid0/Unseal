@@ -1,6 +1,6 @@
 import Foundation
 
-public struct DiagnosticInfo: Equatable, Sendable {
+public struct DiagnosticInfo: Equatable, Sendable, Error {
     public let title: String
     public let message: String
     public let command: String
